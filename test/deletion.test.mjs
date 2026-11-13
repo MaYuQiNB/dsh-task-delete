@@ -354,6 +354,120 @@ async function main() {
     else process.env.DSH_HOME = previousHome
   }
 
+  // ---- orphaned attachment collection ----
+  function attachmentEvent(id) {
+    return {
+      type: 'user/message',
+      data: { content: [{ type: 'image', attachment: { attachmentId: `sha256:${id}` } }] },
+    }
+  }
+
+  function fileAttachmentEvent(id) {
+    return {
+      type: 'tool/result',
+      data: { content: [{ type: 'file', attachment: { attachmentId: id, name: 'notes.txt' } }] },
+    }
+  }
+
+  function fakePersistence(sessions) {
+    return {
+      async list() {
+        return Object.keys(sessions).map((id) => ({ header: { id } }))
+      },
+      async stat(id) {
+        const entry = sessions[id]
+        return entry === undefined ? undefined : { revision: entry.revision }
+      },
+      async open(id) {
+        const entry = sessions[id]
+        if (entry === undefined) throw new Error(`missing session ${id}`)
+        return {
+          async read(offset = 0, length = 500) {
+            return { events: entry.events.slice(offset, offset + length) }
+          },
+          async close() {},
+        }
+      },
+    }
+  }
+
+  const orphanImage = 'a'.repeat(64)
+  const sharedImage = 'b'.repeat(64)
+  const orphanFile = 'c'.repeat(64)
+  const attachmentsRoot = join(home, 'attachments', 'v1')
+  await mkdir(join(attachmentsRoot, 'objects', 'aa'), { recursive: true })
+  await writeFile(join(attachmentsRoot, 'objects', 'aa', orphanImage), 'orphan-image')
+  await mkdir(join(attachmentsRoot, 'objects', 'bb'), { recursive: true })
+  await writeFile(join(attachmentsRoot, 'objects', 'bb', sharedImage), 'shared-image')
+  await mkdir(join(attachmentsRoot, 'file-objects', 'cc'), { recursive: true })
+  await writeFile(join(attachmentsRoot, 'file-objects', 'cc', orphanFile), 'orphan-file')
+  await mkdir(join(attachmentsRoot, 'files', 'cc', orphanFile), { recursive: true })
+  await writeFile(join(attachmentsRoot, 'files', 'cc', orphanFile, 'notes.txt'), 'orphan-link')
+
+  const collectPersistence = fakePersistence({
+    deleted: {
+      revision: '1',
+      events: [attachmentEvent(orphanImage), attachmentEvent(sharedImage), fileAttachmentEvent(orphanFile)],
+    },
+    remaining: { revision: '2', events: [attachmentEvent(sharedImage)] },
+  })
+  const candidates = await __testing.collectAttachmentIdsFromSessions(collectPersistence, ['deleted'], [])
+  assert.deepEqual([...candidates].sort(), [orphanImage, sharedImage, orphanFile].sort())
+
+  const remainingPersistence = fakePersistence({
+    remaining: { revision: '2', events: [attachmentEvent(sharedImage)] },
+  })
+  const attachmentWarnings = []
+  const cleanup = await __testing.cleanupOrphanAttachments({
+    persistence: remainingPersistence,
+    candidates,
+    home,
+    warnings: attachmentWarnings,
+  })
+  assert.deepEqual(attachmentWarnings, [])
+  assert.equal(cleanup.removed, 2)
+  assert.equal(cleanup.kept, 1)
+  assert.equal(cleanup.skipped, false)
+  assert.equal(await exists(join(attachmentsRoot, 'objects', 'aa', orphanImage)), false, 'unreferenced image object is deleted')
+  assert.equal(await exists(join(attachmentsRoot, 'objects', 'bb', sharedImage)), true, 'attachment still referenced by another task is kept')
+  assert.equal(await exists(join(attachmentsRoot, 'file-objects', 'cc', orphanFile)), false, 'unreferenced file object is deleted')
+  assert.equal(await exists(join(attachmentsRoot, 'files', 'cc', orphanFile)), false, 'unreferenced hard-link directory is deleted')
+  assert.equal(await exists(join(attachmentsRoot, 'objects', 'aa')), false, 'emptied attachment shard is pruned')
+
+  // A remaining session that changes during the scan aborts the cleanup.
+  const unstableCandidate = 'd'.repeat(64)
+  await mkdir(join(attachmentsRoot, 'objects', 'dd'), { recursive: true })
+  await writeFile(join(attachmentsRoot, 'objects', 'dd', unstableCandidate), 'unstable-image')
+  let statCalls = 0
+  const unstablePersistence = {
+    async list() {
+      return [{ header: { id: 'busy' } }]
+    },
+    async stat() {
+      statCalls += 1
+      return { revision: String(statCalls) }
+    },
+    async open() {
+      return {
+        async read() {
+          return { events: [] }
+        },
+        async close() {},
+      }
+    },
+  }
+  const unstableWarnings = []
+  const unstable = await __testing.cleanupOrphanAttachments({
+    persistence: unstablePersistence,
+    candidates: new Set([unstableCandidate]),
+    home,
+    warnings: unstableWarnings,
+  })
+  assert.equal(unstable.skipped, true, 'unstable revision aborts attachment cleanup')
+  assert.equal(unstable.removed, 0)
+  assert.equal(await exists(join(attachmentsRoot, 'objects', 'dd', unstableCandidate)), true, 'no attachment is deleted when the scan is unsafe')
+  assert.equal(unstableWarnings.length, 1)
+
   console.log('dsh-task-delete deletion tests: OK')
 }
 

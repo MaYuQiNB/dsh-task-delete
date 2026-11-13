@@ -38,7 +38,13 @@ surface of DSH 0.2.x profiles (`desktop` / `web`).
 2. the task's persisted projection-cache record under `<DSH_HOME>/storages/`;
 3. hidden subagent child session logs owned by the task;
 4. every Automation-tasks reminder bound to the task or its hidden children —
-   including their saved delivery records, removed through the Schedule service.
+   including their saved delivery records, removed through the Schedule service;
+5. attachment objects (image objects, generic file objects, and their hard-link
+   directories) that are referenced only by this task. Every remaining session
+   log is scanned first; anything still referenced by another task stays;
+6. this task's memories in the optional Memory Brain plugin, plus semantic
+   memories whose every source episode belongs to this task. The Client half
+   calls Memory Brain's own endpoint after the deletion succeeds.
 
 The sidebar row disappears immediately. If the deleted task was the one shown
 in the main view, the view switches to a fresh New Session.
@@ -52,21 +58,43 @@ in the main view, the view switches to a fresh New Session.
    committed events.
 3. Delete every reminder bound to the task through the Schedule service, which
    also drops the saved delivery records and refreshes the Automation tasks UI.
-4. Delete the log directories and cache records.
-5. Clear the temporary archive marker and broadcast `api-session/removed`.
-6. If a file is still briefly locked by the live process, deletion is retried;
+4. Delete every reminder bound to the task through the Schedule service, which
+   also drops the saved delivery records and refreshes the Automation tasks UI.
+5. Delete the log directories and cache records.
+6. Scan every remaining session log and delete only attachment objects that no
+   remaining task references.
+7. Clear the temporary archive marker and broadcast `api-session/removed`. The
+   Client half then asks Memory Brain to forget this task's memories.
+8. If a file is still briefly locked by the live process, deletion is retried;
    anything still locked is journaled in
    `<DSH_HOME>/task-delete-pending.json` and removed by the next plugin start.
 
 ## Safety boundaries
 
-- Shared attachment objects are **not** deleted (content-addressed, possibly
-  referenced by other tasks).
+- Attachment objects are deleted only after every remaining session log has been
+  scanned and none references them; shared attachments stay. Pure caches such as
+  request-image transforms are left in place.
+- Memory Brain cleanup removes only episodes owned by this task and semantic
+  memories whose members all came from it; mixed-knowledge semantic memories
+  stay. It is skipped when Memory Brain is not installed.
 - The Workspace itself is not deleted. Stale task ids left in workspace order
   records are invisible and never recreate the task.
 - Scheduled reminders created from the task are deleted with it, including
   their delivery records; nothing remains in Automation tasks.
 - Deletion is hard and irreversible. There is no undo.
+
+## Known limitations
+
+- Orphan-attachment cleanup is safety-first best effort: if a remaining session
+  is still being written (or cannot be read) during the scan, cleanup is skipped
+  with a warning instead of risking removal of a still-referenced object.
+- Memory Brain cleanup is initiated by the Client half right after a successful
+  deletion; if its endpoint is unavailable at that moment, memories may remain
+  and can be forgotten manually in the Memory Brain panel.
+- If a file is still briefly locked by the live process, file deletion may be
+  deferred to the next start (the UI and persisted list drop it immediately).
+- Other-task messages that referenced the deleted task become unreadable old
+  references; they stay inside those tasks' logs.
 
 ## Development
 
@@ -78,11 +106,12 @@ npm test
 ```
 
 - `index.js` — Host half: authenticated local route, artifact discovery,
-  stop/flush pipeline, reminder deletion, deletion, retries, deferred cleanup
-  journal, UI removal event.
+  stop/flush pipeline, reminder deletion, orphan-attachment scan/removal,
+  retries, deferred cleanup journal, UI removal event.
 - `client.js` — Client half: registers the `sidebar.workspaces.session.menu.item`
-  row and the `shell.overlay` confirmation dialog. It uses React and theme
-  tokens only and imports no Harness Client package.
+  row and the `shell.overlay` confirmation dialog, then asks Memory Brain to
+  forget the deleted task's memories. It uses React and theme tokens only and
+  imports no Harness Client package.
 - `locale/*.json`, `icon.svg` — plugin manager display metadata and artwork.
 
 ## License

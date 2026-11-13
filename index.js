@@ -30,6 +30,9 @@ export const DELETE_ROUTE = '/task-delete/delete'
 
 const MAX_BODY_BYTES = 16 * 1024
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/
+const ATTACHMENT_ID_PATTERN = /^(?:sha256:)?([0-9a-fA-F]{64})$/
+const SESSION_EVENT_SCAN_CHUNK = 500
+const SESSION_EVENT_SCAN_MAX = 1_000_000
 const PENDING_JOURNAL_FILE = 'task-delete-pending.json'
 const REMOVE_RETRY_DELAYS_MS = [0, 60, 120, 200, 320, 500, 800]
 const STOP_IDLE_TIMEOUT_MS = 4000
@@ -199,13 +202,16 @@ async function deleteTask(ctx, sessionId) {
   // root must never turn into a silent partial deletion.
   const artifacts = await collectSessionArtifacts({ ids: removedSessionIds, materializedIds, home, roots })
 
-  /** @type {string[]} */
   const warnings = []
   await stopSessionWork(ctx, removedSessionIds, sessionId, warnings)
+  // Read the final logs before deleting them: only attachments actually
+  // referenced by this task are ever candidates for collection.
+  const attachmentCandidates = await collectAttachmentIdsFromSessions(persistence, removedSessionIds, warnings)
   const removedReminders = await removeTaskReminders(ctx, removedSessionIds, warnings)
 
   const removal = await removeCollectedArtifacts({ ...artifacts, ids: removedSessionIds, home, roots, warnings })
   scheduleCacheSweep(home, removedSessionIds)
+  const attachmentCleanup = await cleanupOrphanAttachments({ persistence, candidates: attachmentCandidates, home, warnings })
 
   // The archive we used as the stop gate is now stale data; drop it so no
   // archived-id residue remains for a session that no longer exists.
@@ -229,6 +235,9 @@ async function deleteTask(ctx, sessionId) {
     removedDirectories: removal.removedDirectories.length,
     removedCacheEntries: removal.removedCacheEntries.length,
     removedReminders,
+    removedAttachments: attachmentCleanup.removed,
+    keptSharedAttachments: attachmentCleanup.kept,
+    attachmentCleanupSkipped: attachmentCleanup.skipped,
     deferredCleanup: removal.pendingDirs.length + removal.pendingCaches.length > 0,
     warnings,
   }
@@ -363,6 +372,236 @@ async function removeTaskReminders(ctx, ids, warnings) {
     // Best-effort UI refresh only.
   }
   return removed
+}
+
+/**
+ * Normalize an attachment id to its bare sha256 hex form.
+ * @param {unknown} value Raw id, possibly `sha256:<hex>`.
+ * @returns {string | undefined} Lowercase hex, or undefined for non-ids.
+ */
+function normalizeAttachmentId(value) {
+  if (typeof value !== 'string') return undefined
+  const match = ATTACHMENT_ID_PATTERN.exec(value.trim())
+  return match === null ? undefined : match[1].toLowerCase()
+}
+
+/**
+ * Walk one JSON-like value and collect every `attachmentId` it carries.
+ * @param {unknown} value Event or nested value.
+ * @param {Set<string>} found Collected bare hex ids.
+ * @param {WeakSet<object>} seen Cycle guard.
+ */
+function collectAttachmentIdsIn(value, found, seen) {
+  if (value === null || typeof value !== 'object') return
+  if (seen.has(value)) return
+  seen.add(value)
+  if (Array.isArray(value)) {
+    for (const entry of value) collectAttachmentIdsIn(entry, found, seen)
+    return
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    if (key === 'attachmentId' && typeof entry === 'string') {
+      const id = normalizeAttachmentId(entry)
+      if (id !== undefined) found.add(id)
+    }
+    collectAttachmentIdsIn(entry, found, seen)
+  }
+}
+
+/**
+ * Stream every event of one read handle in bounded chunks.
+ * @param {any} handle Session persistence read handle.
+ * @param {(events: any[]) => void} onEvents Chunk consumer.
+ */
+async function forEachEventChunk(handle, onEvents) {
+  let offset = 0
+  while (offset < SESSION_EVENT_SCAN_MAX) {
+    const chunk = await handle.read(offset, SESSION_EVENT_SCAN_CHUNK)
+    const events = Array.isArray(chunk?.events) ? chunk.events : []
+    if (events.length === 0) return
+    onEvents(events)
+    offset += events.length
+    if (events.length < SESSION_EVENT_SCAN_CHUNK) return
+  }
+  throw new Error('会话事件数量超出安全扫描上限')
+}
+
+/**
+ * Collect attachment ids referenced by the about-to-be-deleted sessions.
+ *
+ * Runs after the work has been stopped and flushed, so the task's final log is
+ * the authority for which attachment objects it owned. A read failure only
+ * disables attachment collection; it never blocks deleting the task.
+ *
+ * @param {any} persistence Session persistence service.
+ * @param {readonly string[]} ids Doomed session ids.
+ * @param {string[]} warnings Warning sink.
+ * @returns {Promise<Set<string>>} Bare sha256 ids.
+ */
+export async function collectAttachmentIdsFromSessions(persistence, ids, warnings = []) {
+  const found = new Set()
+  for (const id of ids) {
+    let handle
+    try {
+      handle = await persistence.open(id, 'read')
+    } catch (error) {
+      warnings.push(`无法读取任务 ${id} 的附件引用，已跳过该任务的附件清理：${error instanceof Error ? error.message : String(error)}`)
+      continue
+    }
+    try {
+      await forEachEventChunk(handle, (events) => {
+        const seen = new WeakSet()
+        for (const event of events) collectAttachmentIdsIn(event, found, seen)
+      })
+    } catch (error) {
+      warnings.push(`扫描任务 ${id} 的附件引用失败，已跳过该任务的附件清理：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      try {
+        await handle.close?.()
+      } catch {
+        // Read handles are advisory; close failures do not affect deletion.
+      }
+    }
+  }
+  return found
+}
+
+/**
+ * Scan one remaining session log for references to any candidate attachment.
+ *
+ * The log's revision is checked before and after the read; a change means a
+ * concurrent write may carry a reference the scan did not see, so the caller
+ * must not treat "not found" as proof.
+ *
+ * @param {any} persistence Session persistence service.
+ * @param {string} sessionId Remaining session id.
+ * @param {ReadonlySet<string>} candidates Candidate attachment ids.
+ * @returns {Promise<Set<string>>} Candidate ids referenced by this session.
+ */
+async function collectReferencedAttachmentIds(persistence, sessionId, candidates) {
+  const before = await persistence.stat(sessionId)
+  const beforeRevision = before === undefined ? undefined : String(before.revision)
+  let handle
+  try {
+    handle = await persistence.open(sessionId, 'read')
+  } catch (error) {
+    throw new Error(`无法打开剩余任务 ${sessionId}：${error instanceof Error ? error.message : String(error)}`)
+  }
+  const found = new Set()
+  try {
+    await forEachEventChunk(handle, (events) => {
+      for (const event of events) {
+        const ids = new Set()
+        collectAttachmentIdsIn(event, ids, new WeakSet())
+        for (const id of ids) if (candidates.has(id)) found.add(id)
+      }
+    })
+  } finally {
+    try {
+      await handle.close?.()
+    } catch {
+      // Ignore close failures; the revision check below decides safety.
+    }
+  }
+  const after = await persistence.stat(sessionId)
+  const afterRevision = after === undefined ? undefined : String(after.revision)
+  if (beforeRevision === undefined || afterRevision === undefined || beforeRevision !== afterRevision) {
+    throw new Error(`剩余任务 ${sessionId} 在扫描期间发生了变化`)
+  }
+  return found
+}
+
+/**
+ * Delete attachment objects referenced only by the deleted task.
+ *
+ * Every remaining persisted session is scanned first. If any log cannot be read
+ * or changes while it is being scanned, collection is skipped entirely: an
+ * attachment that might still be referenced is never removed.
+ *
+ * @param {{ persistence: any, candidates: ReadonlySet<string>, home: string, warnings: string[] }} input
+ * @returns {Promise<{ removed: number, kept: number, skipped: boolean }>}
+ */
+export async function cleanupOrphanAttachments({ persistence, candidates, home, warnings }) {
+  if (!(candidates instanceof Set) || candidates.size === 0) {
+    return { removed: 0, kept: 0, skipped: false }
+  }
+  let snapshots
+  try {
+    snapshots = await persistence.list()
+  } catch (error) {
+    warnings.push(`附件清理已跳过：无法列出剩余任务（${error instanceof Error ? error.message : String(error)}）。`)
+    return { removed: 0, kept: candidates.size, skipped: true }
+  }
+  const referenced = new Set()
+  try {
+    for (const snapshot of snapshots) {
+      const sessionId = String(snapshot.header.id)
+      const used = await collectReferencedAttachmentIds(persistence, sessionId, candidates)
+      for (const id of used) referenced.add(id)
+    }
+  } catch (error) {
+    warnings.push(`附件清理已跳过：无法确认剩余任务是否引用（${error instanceof Error ? error.message : String(error)}）。`)
+    return { removed: 0, kept: candidates.size, skipped: true }
+  }
+  const orphaned = [...candidates].filter((id) => !referenced.has(id))
+  const removed = await deleteAttachmentObjects(home, orphaned, warnings)
+  return { removed, kept: candidates.size - orphaned.length, skipped: false }
+}
+
+/**
+ * Delete the image object, generic file object, and hard-link directory of the
+ * given attachment ids. Missing families are a no-op.
+ * @param {string} home Resolved DSH home directory.
+ * @param {readonly string[]} ids Bare sha256 attachment ids.
+ * @param {string[]} warnings Warning sink.
+ * @returns {Promise<number>} Ids with at least one object removed.
+ */
+export async function deleteAttachmentObjects(home, ids, warnings) {
+  const attachmentRoot = join(resolve(home), 'attachments', 'v1')
+  let removed = 0
+  for (const id of ids) {
+    const prefix = id.slice(0, 2)
+    const targets = [
+      join(attachmentRoot, 'objects', prefix, id),
+      join(attachmentRoot, 'file-objects', prefix, id),
+      join(attachmentRoot, 'files', prefix, id),
+    ]
+    let removedAny = false
+    for (const target of targets) {
+      if (!(await pathExists(target))) continue
+      try {
+        await rm(target, { recursive: true, force: true })
+        removedAny = true
+      } catch (error) {
+        warnings.push(`无法删除附件对象 ${id}：${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    if (removedAny) removed += 1
+    for (const family of ['objects', 'file-objects', 'files']) {
+      const shard = join(attachmentRoot, family, prefix)
+      try {
+        const entries = await readdir(shard)
+        if (entries.length === 0) await rmdir(shard)
+      } catch {
+        // The shard is shared with other attachments or already gone.
+      }
+    }
+  }
+  return removed
+}
+
+/**
+ * Whether a path exists (used to count only real attachment removals).
+ * @param {string} path Absolute path.
+ * @returns {Promise<boolean>}
+ */
+async function pathExists(path) {
+  try {
+    await stat(path)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -761,7 +1000,10 @@ function delay(ms) {
 /** Exposed for unit tests (not part of the plugin API). */
 export const __testing = {
   SESSION_ID_PATTERN,
+  cleanupOrphanAttachments,
+  collectAttachmentIdsFromSessions,
   collectSessionArtifacts,
+  deleteAttachmentObjects,
   deleteTask,
   findProjectionCacheFiles,
   findSessionDirs,

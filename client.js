@@ -24,7 +24,7 @@ window.__ModuleLoader__.load({
       'menu.deleteTask': '删除任务',
       'dialog.title': '彻底删除这个任务？',
       'dialog.untitled': '未命名任务',
-      'dialog.description': '“{title}”的会话记录、本地日志、缓存以及关联的定时提醒将从这台电脑上永久删除。',
+      'dialog.description': '“{title}”的会话记录、本地日志、缓存、定时提醒、无主附件以及记忆脑中的相关记忆将被永久清理。',
       'dialog.irreversible': '此操作不可撤销，删除后无法恢复。',
       'dialog.stopWarning': '该任务正在运行或打开。继续删除会先停止它的工作，再从本机移除记录。',
       'dialog.cancel': '取消',
@@ -37,7 +37,7 @@ window.__ModuleLoader__.load({
       'menu.deleteTask': 'Delete task',
       'dialog.title': 'Delete this task permanently?',
       'dialog.untitled': 'Untitled task',
-      'dialog.description': 'The conversation, local logs, cache, and any scheduled reminders of “{title}” will be permanently deleted from this computer.',
+      'dialog.description': 'The conversation, local logs, cache, scheduled reminders, orphaned attachments, and related Memory Brain memories of “{title}” will be permanently cleaned up.',
       'dialog.irreversible': 'This cannot be undone.',
       'dialog.stopWarning': 'This task is running or open. Deleting it first stops its work, then removes the local records.',
       'dialog.cancel': 'Cancel',
@@ -127,7 +127,7 @@ window.__ModuleLoader__.load({
      * Frame-wide dialog shell; renders only while a delete was requested.
      * @param {object} props Deletion request source and actions.
      */
-    function DeleteTaskDialog({ useTaskDeleteRequest, settleTaskDelete, performTaskDelete, isSessionOpen, leaveDeletedSession, t }) {
+    function DeleteTaskDialog({ useTaskDeleteRequest, settleTaskDelete, performTaskDelete, isSessionOpen, leaveDeletedSession, forgetDeletedTaskMemories, t }) {
       const request = useTaskDeleteRequest((pending) => pending)
       if (request === null) return null
       return h(DeleteTaskDialogBody, {
@@ -137,6 +137,7 @@ window.__ModuleLoader__.load({
         performTaskDelete,
         isSessionOpen,
         leaveDeletedSession,
+        forgetDeletedTaskMemories,
         t,
       })
     }
@@ -145,7 +146,7 @@ window.__ModuleLoader__.load({
      * One confirmation dialog; remounted per request so in-flight state is fresh.
      * @param {object} props Request, settlement, Host call, live-state probe, locale.
      */
-    function DeleteTaskDialogBody({ request, settleTaskDelete, performTaskDelete, isSessionOpen, leaveDeletedSession, t }) {
+    function DeleteTaskDialogBody({ request, settleTaskDelete, performTaskDelete, isSessionOpen, leaveDeletedSession, forgetDeletedTaskMemories, t }) {
       const [busy, setBusy] = React.useState(false)
       const [error, setError] = React.useState(null)
       const dialogRef = React.useRef(null)
@@ -207,6 +208,9 @@ window.__ModuleLoader__.load({
         const outcome = await performTaskDelete(request.sessionId)
         if (outcome.ok) {
           if (wasOpen) leaveDeletedSession(request.sessionId)
+          // Memory Brain keeps its own store beside the Session log; forget the
+          // deleted task's memories after the task itself is gone.
+          void forgetDeletedTaskMemories(outcome.removedSessionIds)
           settleTaskDelete()
           return
         }
@@ -296,13 +300,73 @@ window.__ModuleLoader__.load({
             body: JSON.stringify({ sessionId }),
           })
           const payload = await response.json().catch(() => null)
-          if (response.ok && payload !== null && payload.ok === true) return { ok: true }
+          if (response.ok && payload !== null && payload.ok === true) {
+            return {
+              ok: true,
+              removedSessionIds: Array.isArray(payload.removedSessionIds)
+                ? payload.removedSessionIds.map((id) => String(id))
+                : [],
+            }
+          }
           const message = payload !== null && payload.error !== undefined && typeof payload.error.message === 'string'
             ? payload.error.message
             : `HTTP ${response.status}`
           return { ok: false, message }
         } catch (error) {
           return { ok: false, message: error instanceof Error ? error.message : String(error) }
+        }
+      }
+
+      /**
+       * Forget memories owned by the deleted task in the optional Memory Brain
+       * plugin. Entirely best-effort: the plugin may be absent, or its route may
+       * reject a non-browser caller; neither can undo the Host deletion.
+       * @param {readonly string[]} sessionIds Session identities removed by the Host.
+       */
+      const forgetDeletedTaskMemories = async (sessionIds) => {
+        const targets = new Set(
+          (Array.isArray(sessionIds) ? sessionIds : [])
+            .map((id) => String(id))
+            .filter((id) => id !== ''),
+        )
+        if (targets.size === 0) return
+        try {
+          const stateResponse = await fetch('/memory-brain/state', {
+            method: 'GET',
+            headers: { accept: 'application/json' },
+          })
+          if (!stateResponse.ok) return
+          const statePayload = await stateResponse.json().catch(() => null)
+          const nodes = statePayload?.state?.nodes
+          if (!Array.isArray(nodes)) return
+          /** @type {Map<string, string>} memory id -> owning session id, episodes only */
+          const episodeSession = new Map()
+          const doomed = new Set()
+          for (const node of nodes) {
+            if (node === null || typeof node !== 'object' || typeof node.id !== 'string') continue
+            if (node.kind === 'semantic') continue
+            const owner = String(node.sessionId ?? '')
+            episodeSession.set(node.id, owner)
+            if (targets.has(owner)) doomed.add(node.id)
+          }
+          for (const node of nodes) {
+            if (node === null || typeof node !== 'object' || node.kind !== 'semantic' || typeof node.id !== 'string') continue
+            const members = Array.isArray(node.memberIds) ? node.memberIds : []
+            // Only a semantic memory whose every source episode belongs to the
+            // deleted task is task-owned; mixed knowledge stays.
+            if (members.length > 0 && members.every((member) => targets.has(episodeSession.get(member) ?? ''))) {
+              doomed.add(node.id)
+            }
+          }
+          for (const id of doomed) {
+            await fetch('/memory-brain/forget', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ id, hard: true }),
+            }).catch(() => {})
+          }
+        } catch {
+          // Memory Brain is optional; deletion never depends on it.
         }
       }
 
@@ -339,6 +403,7 @@ window.__ModuleLoader__.load({
           performTaskDelete,
           isSessionOpen,
           leaveDeletedSession,
+          forgetDeletedTaskMemories,
         }),
       }, DeleteTaskDialog))
     }
