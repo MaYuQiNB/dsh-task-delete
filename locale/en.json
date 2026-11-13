@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Task Delete",
-    "description": "Adds a permanent Delete action to each Workspace task's \"...\" menu and removes the task's local records from this computer."
+    "description": "Adds a permanent Delete action to each Workspace task's \"...\" menu and removes the task's local records and scheduled reminders from this computer."
   }
 }

@@ -202,6 +202,7 @@ async function deleteTask(ctx, sessionId) {
   /** @type {string[]} */
   const warnings = []
   await stopSessionWork(ctx, removedSessionIds, sessionId, warnings)
+  const removedReminders = await removeTaskReminders(ctx, removedSessionIds, warnings)
 
   const removal = await removeCollectedArtifacts({ ...artifacts, ids: removedSessionIds, home, roots, warnings })
   scheduleCacheSweep(home, removedSessionIds)
@@ -227,6 +228,7 @@ async function deleteTask(ctx, sessionId) {
     removedSessionIds,
     removedDirectories: removal.removedDirectories.length,
     removedCacheEntries: removal.removedCacheEntries.length,
+    removedReminders,
     deferredCleanup: removal.pendingDirs.length + removal.pendingCaches.length > 0,
     warnings,
   }
@@ -306,6 +308,61 @@ async function stopSessionWork(ctx, ids, rootId, warnings) {
       warnings.push(`无法刷新任务 ${id} 的待写事件：${error instanceof Error ? error.message : String(error)}`)
     }
   }
+}
+
+/**
+ * Delete every Automation-tasks reminder bound to the doomed sessions.
+ *
+ * The Schedule service owns those rows; deleting them through `delete()` also
+ * drops their saved delivery records and stops future deliveries. Reminders are
+ * removed after the task's work has been stopped (so no delivery is in flight)
+ * and before its session log is removed (so the binding is still intact).
+ *
+ * @param {import('@deepseek-ai/cordis').Context} ctx Host plugin context.
+ * @param {readonly string[]} ids Doomed session ids.
+ * @param {string[]} warnings Warning sink.
+ * @returns {Promise<number>} Number of reminder rows deleted.
+ */
+async function removeTaskReminders(ctx, ids, warnings) {
+  const schedule = ctx.get('schedule')
+  if (schedule === undefined || typeof schedule.catalog !== 'function' || typeof schedule.delete !== 'function') {
+    return 0
+  }
+  let entries
+  try {
+    entries = await schedule.catalog()
+  } catch (error) {
+    warnings.push(`无法读取任务的定时提醒：${error instanceof Error ? error.message : String(error)}`)
+    return 0
+  }
+  const targets = new Set(ids)
+  const owned = Array.isArray(entries)
+    ? entries.filter((entry) => entry !== null && typeof entry === 'object' && targets.has(String(entry.sessionId)))
+    : []
+  if (owned.length === 0) return 0
+
+  let removed = 0
+  for (const entry of owned) {
+    try {
+      const result = await schedule.delete({ sessionId: entry.sessionId, id: entry.id })
+      if (result !== null && typeof result === 'object' && result.deleted === true) {
+        removed += 1
+      } else {
+        warnings.push(`定时提醒 ${String(entry.id)} 未能删除（${result?.code ?? 'unknown'}）。`)
+      }
+    } catch (error) {
+      warnings.push(`删除定时提醒 ${String(entry.id)} 失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  // The Schedule service normally announces its own change; this payload-free
+  // invalidation is harmless if it already did and repairs a composition where
+  // it did not.
+  try {
+    ctx.emit('schedule/changed')
+  } catch {
+    // Best-effort UI refresh only.
+  }
+  return removed
 }
 
 /**
@@ -711,6 +768,7 @@ export const __testing = {
   isMaterialized,
   readPendingJournal,
   removeCollectedArtifacts,
+  removeTaskReminders,
   resolveDshHome,
   sessionRoots,
   stopSessionWork,

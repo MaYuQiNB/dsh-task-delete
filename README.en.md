@@ -7,7 +7,7 @@ Web sidebar.
 
 - Hover a task row and click its `...` menu.
 - The menu gains a **Delete task** row at the end.
-- Confirm, and the task is removed from this computer.
+- Confirm, and the task and its scheduled reminders are removed from this computer.
 
 **A running or currently open task can be deleted too.** Confirming stops its
 work first, then removes the local records.
@@ -36,7 +36,9 @@ surface of DSH 0.2.x profiles (`desktop` / `web`).
 1. `<DSH_HOME>/sessions/<project-dir>/<task-id>/` — the session log directory,
    all format generations included;
 2. the task's persisted projection-cache record under `<DSH_HOME>/storages/`;
-3. hidden subagent child session logs owned by the task.
+3. hidden subagent child session logs owned by the task;
+4. every Automation-tasks reminder bound to the task or its hidden children —
+   including their saved delivery records, removed through the Schedule service.
 
 The sidebar row disappears immediately. If the deleted task was the one shown
 in the main view, the view switches to a fresh New Session.
@@ -48,9 +50,11 @@ in the main view, the view switches to a fresh New Session.
    subagents, and active reminders.
 2. Explicitly cancel the live agent, wait for it to go idle, and flush
    committed events.
-3. Delete the log directories and cache records.
-4. Clear the temporary archive marker and broadcast `api-session/removed`.
-5. If a file is still briefly locked by the live process, deletion is retried;
+3. Delete every reminder bound to the task through the Schedule service, which
+   also drops the saved delivery records and refreshes the Automation tasks UI.
+4. Delete the log directories and cache records.
+5. Clear the temporary archive marker and broadcast `api-session/removed`.
+6. If a file is still briefly locked by the live process, deletion is retried;
    anything still locked is journaled in
    `<DSH_HOME>/task-delete-pending.json` and removed by the next plugin start.
 
@@ -60,8 +64,8 @@ in the main view, the view switches to a fresh New Session.
   referenced by other tasks).
 - The Workspace itself is not deleted. Stale task ids left in workspace order
   records are invisible and never recreate the task.
-- Scheduled reminders created from the task are separate Automation-task
-  records and are not deleted by this plugin.
+- Scheduled reminders created from the task are deleted with it, including
+  their delivery records; nothing remains in Automation tasks.
 - Deletion is hard and irreversible. There is no undo.
 
 ## Development
@@ -74,8 +78,8 @@ npm test
 ```
 
 - `index.js` — Host half: authenticated local route, artifact discovery,
-  stop/flush pipeline, deletion, retries, deferred cleanup journal, UI removal
-  event.
+  stop/flush pipeline, reminder deletion, deletion, retries, deferred cleanup
+  journal, UI removal event.
 - `client.js` — Client half: registers the `sidebar.workspaces.session.menu.item`
   row and the `shell.overlay` confirmation dialog. It uses React and theme
   tokens only and imports no Harness Client package.

@@ -1,6 +1,6 @@
 {
   "name": "dsh-task-delete",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Hard-delete a Workspace task (session) from the DSH sidebar '...' menu, even while it is running.",
   "type": "module",
   "main": "index.js",

@@ -1,4 +1,4 @@
-﻿// Unit test for dsh-task-delete's deletion pipeline.
+// Unit test for dsh-task-delete's deletion pipeline.
 // Runs against a throwaway directory tree that mimics <DSH_HOME>.
 import { mkdir, readFile, rm, writeFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -35,8 +35,15 @@ function snapshot(id, extra = {}) {
 /**
  * Minimal Host context for deleteTask orchestration tests.
  * `live` sessions get fake Session objects; `liveAgents` get fake Agent objects.
+ * `reminders` are the Schedule catalog rows visible to the fake Schedule service.
  */
-function mockContext(snapshots, { live = new Set(), liveAgents = new Set(), archived = [] } = {}) {
+function mockContext(snapshots, {
+  live = new Set(),
+  liveAgents = new Set(),
+  archived = [],
+  reminders = [],
+  withSchedule = true,
+} = {}) {
   const emitted = []
   const archiveCalls = []
   const unarchiveCalls = []
@@ -44,6 +51,7 @@ function mockContext(snapshots, { live = new Set(), liveAgents = new Set(), arch
   const flushCalls = []
   const cancelCalls = []
   const whenIdleCalls = []
+  const reminderDeletes = []
 
   const agents = new Map()
   for (const id of liveAgents) {
@@ -79,6 +87,16 @@ function mockContext(snapshots, { live = new Set(), liveAgents = new Set(), arch
     },
   }
 
+  const schedule = {
+    async catalog() {
+      return reminders
+    },
+    async delete(request) {
+      reminderDeletes.push(request)
+      return { id: request.id, deleted: true }
+    },
+  }
+
   return {
     emitted,
     archiveCalls,
@@ -87,6 +105,7 @@ function mockContext(snapshots, { live = new Set(), liveAgents = new Set(), arch
     flushCalls,
     cancelCalls,
     whenIdleCalls,
+    reminderDeletes,
     ctx: {
       sessionPersistence: { list: async () => snapshots, config: { root } },
       sessions: {
@@ -94,12 +113,16 @@ function mockContext(snapshots, { live = new Set(), liveAgents = new Set(), arch
         flush: async (session) => session.flush(),
       },
       agents: { get: (id) => agents.get(id) },
-      get: (name) => (name === 'workspaceRegistry' ? registry : undefined),
+      get: (name) => {
+        if (name === 'workspaceRegistry') return registry
+        if (name === 'schedule') return withSchedule ? schedule : undefined
+        return undefined
+      },
       async parallel(name, request) {
         parallelCalls.push([name, request])
       },
       emit: (name, args) => {
-        emitted.push([name, args])
+        emitted.push(args === undefined ? [name] : [name, args])
       },
       logger: { warn() {} },
     },
@@ -151,7 +174,7 @@ async function main() {
   assert.equal(roots[0], root)
   assert.ok(roots.includes(join(home, 'sessions')))
 
-  // 鈹€鈹€ collect + remove low-level pipeline 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+  // ---- collect + remove low-level pipeline ----
   const collected = await __testing.collectSessionArtifacts({
     ids: [target, child],
     materializedIds: new Set([target, child]),
@@ -169,7 +192,7 @@ async function main() {
     roots,
     warnings,
   })
-  assert.deepEqual(warnings.filter((entry) => !entry.includes('鍗犵敤')), [])
+  assert.deepEqual(warnings, [])
   assert.equal(removal.removedDirectories.length, 2)
   assert.equal(removal.removedCacheEntries.length, 2)
   assert.deepEqual(removal.pendingDirs, [])
@@ -204,7 +227,7 @@ async function main() {
   assert.equal(blank.logDirs.length, 0)
   assert.equal(blank.cacheFiles.length, 0)
 
-  // 鈹€鈹€ full deleteTask orchestration with a mocked Host context 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+  // ---- full deleteTask orchestration with a mocked Host context ----
   const previousHome = process.env.DSH_HOME
   process.env.DSH_HOME = home
   try {
@@ -219,10 +242,21 @@ async function main() {
       snapshot(childId, { parentSession: rootId, origin: 'subagent' }),
       snapshot(otherId),
     ]
-    const normal = mockContext(snapshots)
+    const reminders = [
+      { id: 'schedule-1', sessionId: rootId, title: 'root reminder', status: 'active' },
+      { id: 'schedule-2', sessionId: childId, title: 'child reminder', status: 'inactive' },
+      { id: 'schedule-3', sessionId: otherId, title: 'unrelated reminder', status: 'active' },
+    ]
+    const normal = mockContext(snapshots, { reminders })
     const report = await __testing.deleteTask(normal.ctx, rootId)
     assert.deepEqual(report.removedSessionIds.sort(), [rootId, childId].sort(), 'deletes the task and hidden subagent children')
+    assert.equal(report.removedReminders, 2, 'deletes the task reminders and hidden-child reminders only')
+    assert.deepEqual(normal.reminderDeletes, [
+      { sessionId: rootId, id: 'schedule-1' },
+      { sessionId: childId, id: 'schedule-2' },
+    ])
     assert.deepEqual(normal.emitted, [
+      ['schedule/changed'],
       ['api-session/removed', rootId],
       ['api-session/removed', childId],
     ])
@@ -232,12 +266,19 @@ async function main() {
     assert.equal(await exists(join(root, 'proj-d', childId)), false)
     assert.equal(await exists(join(root, 'proj-d', otherId)), true, 'other task survives')
 
+    // The Schedule service is optional: deleting a task works without it.
+    const noSchedule = mockContext([snapshot(otherId)], { withSchedule: false })
+    const noScheduleWarnings = []
+    assert.equal(await __testing.removeTaskReminders(noSchedule.ctx, [otherId], noScheduleWarnings), 0)
+    assert.deepEqual(noScheduleWarnings, [])
+
     // A running/open task is stopped, deleted, and removed from the UI.
     const liveId = 'session-99999999-9999-9999-9999-999999999999'
     await writeArtifacts(liveId, 'proj-e')
     const live = mockContext([snapshot(liveId)], {
       live: new Set([liveId]),
       liveAgents: new Set([liveId]),
+      reminders: [{ id: 'schedule-live', sessionId: liveId, title: 'live reminder', status: 'active' }],
     })
     const liveReport = await __testing.deleteTask(live.ctx, liveId)
     assert.equal(await exists(join(root, 'proj-e', liveId)), false, 'running task is deleted')
@@ -245,7 +286,12 @@ async function main() {
     assert.deepEqual(live.cancelCalls, [[liveId, { kind: 'user' }]], 'cancels the running turn')
     assert.deepEqual(live.whenIdleCalls, [liveId], 'waits for the live agent to settle')
     assert.deepEqual(live.flushCalls, [liveId], 'flushes committed events before deleting')
-    assert.deepEqual(live.emitted, [['api-session/removed', liveId]])
+    assert.equal(liveReport.removedReminders, 1)
+    assert.deepEqual(live.reminderDeletes, [{ sessionId: liveId, id: 'schedule-live' }])
+    assert.deepEqual(live.emitted, [
+      ['schedule/changed'],
+      ['api-session/removed', liveId],
+    ])
     assert.equal(liveReport.removedSessionIds[0], liveId)
 
     // An already-archived running task skips the archive path but still stops
@@ -284,8 +330,9 @@ async function main() {
       (error) => error.code === 'session-files-missing',
     )
     assert.deepEqual(ghost.archiveCalls, [], 'preflight failure does not stop or archive anything')
+    assert.deepEqual(ghost.reminderDeletes, [], 'preflight failure does not delete reminders')
 
-    // 鈹€鈹€ deferred-cleanup journal sweep 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- deferred-cleanup journal sweep ----
     const pendingId = 'session-dddddddd-dddd-dddd-dddd-dddddddddddd'
     await writeArtifacts(pendingId, 'proj-g')
     await writeFile(journalFile, JSON.stringify({
@@ -315,4 +362,3 @@ try {
 } finally {
   await rm(base, { recursive: true, force: true })
 }
-
